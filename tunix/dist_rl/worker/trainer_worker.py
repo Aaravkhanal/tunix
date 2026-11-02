@@ -14,9 +14,13 @@
 
 """TrainerWorker implementation for role-based isolation."""
 
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
 import contextlib
 import functools
-from typing import Any, Callable, ContextManager, cast
+import time
+from typing import Any, ContextManager, TYPE_CHECKING, cast
 
 from flax import nnx
 import jax
@@ -28,7 +32,166 @@ from tunix.dist_rl.worker import abstract_worker
 from tunix.rl import common as rl_common
 from tunix.rl import packing
 
+if TYPE_CHECKING:
+  from opentelemetry import metrics as otel_metrics_types  # pylint: disable=g-bad-import-order,g-import-not-at-top
+
+try:
+  from opentelemetry import metrics as otel_metrics  # pylint: disable=g-import-not-at-top
+except ImportError:
+  otel_metrics = None
+
 WorkerState = datatypes.WorkerState
+
+
+class _TrainerWorkerOtelMetrics:
+  """Encapsulates OpenTelemetry instruments and recording for TrainerWorker.
+
+  Note on async JAX dispatch (TODO(b/579110728)): `fwd_bwd` and `update` record
+  host-side execution/dispatch duration so microbatch pipelining is not blocked
+  by host synchronization; queued device execution time surfaces in the next
+  host-synchronizing call (such as `prepare_weight_sync` ->
+  `tunix.trainer.weight_sync.duration{direction="send"}` or `per_token_logps`).
+  """
+
+  def __init__(
+      self,
+      worker_id: str,
+      meter_provider: otel_metrics_types.MeterProvider | None = None,
+      clock: Callable[[], float] = time.time,
+  ):
+    self._worker_id = worker_id
+    self._clock = clock
+    self.last_free_time_s: float | None = None
+    if otel_metrics is None:
+      self._enabled = False
+      return
+    self._enabled = True
+
+    provider = meter_provider or otel_metrics.get_meter_provider()
+    meter = provider.get_meter("tunix.trainer")
+    self._step_duration = meter.create_histogram(
+        "tunix.trainer.step.duration",
+        unit="s",
+        description=(
+            "Host-side execution or dispatch duration of trainer worker"
+            " operations by phase."
+        ),
+    )
+    self._tokens_processed = meter.create_counter(
+        "tunix.trainer.tokens.processed",
+        unit="{token}",
+        description=(
+            "Total valid and padded tokens processed by the trainer worker (on"
+            " unpacked RL payloads without segment_ids, loss-masked tokens"
+            " count as padded until valid_tokens metadata is stamped)."
+        ),
+    )
+    self._weight_sync_duration = meter.create_histogram(
+        "tunix.trainer.weight_sync.duration",
+        unit="s",
+        description=(
+            "Duration of trainer weight sync staging and release (staging"
+            " includes waiting on queued device work)."
+        ),
+    )
+    self._starvation_duration = meter.create_histogram(
+        "tunix.trainer.starvation.duration",
+        unit="s",
+        description=(
+            "Trainer idle or data-fetch starvation time before a microbatch."
+        ),
+    )
+
+  def mark_free(self, *, arm: bool = False) -> None:
+    """Updates the wall-clock timestamp when the trainer worker becomes free."""
+    if arm or self.last_free_time_s is not None:
+      self.last_free_time_s = self._clock()
+
+  def record_starvation(self, req_metadata: Mapping[str, Any] | None) -> None:
+    """Records trainer_idle and data_fetch_delay before a microbatch."""
+    if not self._enabled or self.last_free_time_s is None:
+      return
+    now_wall_s = self._clock()
+    idle_s = max(0.0, now_wall_s - self.last_free_time_s)
+    self._starvation_duration.record(
+        float(idle_s),
+        attributes={"worker_id": self._worker_id, "kind": "trainer_idle"},
+    )
+    if req_metadata and req_metadata.get("mb_ready_time_s") is not None:
+      try:
+        mb_ready_s = float(req_metadata["mb_ready_time_s"])
+      except (TypeError, ValueError):
+        return
+      fetch_delay_s = max(
+          0.0, now_wall_s - max(self.last_free_time_s, mb_ready_s)
+      )
+      self._starvation_duration.record(
+          float(fetch_delay_s),
+          attributes={
+              "worker_id": self._worker_id,
+              "kind": "data_fetch_delay",
+          },
+      )
+
+  def record_step_duration(self, phase: str, duration_s: float) -> None:
+    if self._enabled:
+      self._step_duration.record(
+          float(duration_s),
+          attributes={"worker_id": self._worker_id, "phase": phase},
+      )
+
+  def record_weight_sync_duration(
+      self, direction: str, duration_s: float
+  ) -> None:
+    if self._enabled:
+      self._weight_sync_duration.record(
+          float(duration_s),
+          attributes={"worker_id": self._worker_id, "direction": direction},
+      )
+
+  def record_payload_tokens(self, payload: datatypes.TrainerPayload) -> None:
+    """Records valid and padded token counts for an RL or SFT payload."""
+    if not self._enabled:
+      return
+    valid_tokens: int | None = None
+    total_tokens: int | None = None
+    if isinstance(payload, datatypes.RLTrainerPayload):
+      prompt_size = int(np.asarray(payload.prompt_ids).size)
+      completion_size = int(np.asarray(payload.completion_ids).size)
+      total_tokens = prompt_size + completion_size
+      if payload.segment_ids is not None:
+        seg_ids = np.asarray(payload.segment_ids)
+        if seg_ids.size == total_tokens:
+          valid_tokens = int(np.sum(seg_ids > 0))
+        else:
+          valid_tokens = int(
+              np.sum(np.asarray(payload.prompt_mask) > 0) + np.sum(seg_ids > 0)
+          )
+      else:
+        # TODO(b/579110728): Read stamped non-padding `valid_tokens` from
+        # `payload.metadata` once `PaddedBatchAssembler` populates it, so
+        # loss-masked multi-turn observation tokens are not counted as padded.
+        valid_tokens = int(
+            np.sum(np.asarray(payload.prompt_mask) > 0)
+            + np.sum(np.asarray(payload.completion_mask) > 0)
+        )
+    elif isinstance(payload, datatypes.SFTTrainerPayload):
+      total_tokens = int(np.asarray(payload.token_ids).size)
+      if payload.segment_ids is not None:
+        valid_tokens = int(np.sum(np.asarray(payload.segment_ids) > 0))
+      else:
+        valid_tokens = int(np.sum(np.asarray(payload.token_mask) > 0))
+    if valid_tokens is not None and total_tokens is not None:
+      valid_tokens = min(max(0, valid_tokens), total_tokens)
+      padded_tokens = total_tokens - valid_tokens
+      self._tokens_processed.add(
+          valid_tokens,
+          attributes={"worker_id": self._worker_id, "token_type": "valid"},
+      )
+      self._tokens_processed.add(
+          padded_tokens,
+          attributes={"worker_id": self._worker_id, "token_type": "padded"},
+      )
 
 
 def _compute_per_token_logps(
@@ -68,6 +231,7 @@ class TrainerWorker(abstract_worker.Worker):
       logps_chunk_size: int = 0,
       logps_micro_batch_size: int | None = None,
       execution_context: Any = None,
+      otel_meter_provider: otel_metrics_types.MeterProvider | None = None,
   ):
     """Initializes the TrainerWorker.
 
@@ -78,8 +242,10 @@ class TrainerWorker(abstract_worker.Worker):
         a context manager (e.g., a JAX Mesh) to enter during trainer
         initialization and worker method execution.
       logps_chunk_size: Optionally chunk the vocab (final-logits) computation.
-      logps_micro_batch_size: Row chunk size for `per_token_logps`.
-        If `None`, the whole request is scored in one forward.
+      logps_micro_batch_size: Row chunk size for `per_token_logps`. If `None`,
+        the whole request is scored in one forward.
+      otel_meter_provider: Optional OpenTelemetry MeterProvider override for
+        testing; defaults to the global MeterProvider when None.
     """
     self._execution_context = execution_context
     self._trainer_factory = trainer_factory
@@ -96,6 +262,9 @@ class TrainerWorker(abstract_worker.Worker):
     self._last_error: str | None = None
     # Set when `stop()` failed to close the trainer; later stops re-raise it.
     self._stop_error: str | None = None
+    self._otel = _TrainerWorkerOtelMetrics(
+        worker_id=worker_id, meter_provider=otel_meter_provider
+    )
 
   def _policy_version(self) -> int:
     trainer = self._trainer
@@ -167,6 +336,7 @@ class TrainerWorker(abstract_worker.Worker):
     finally:
       if self.state == WorkerState.COMPILING:
         self.state = WorkerState.READY
+      self._otel.mark_free()
 
   @abstract_worker.offload_to_thread
   def start(self) -> datatypes.Response:
@@ -296,30 +466,45 @@ class TrainerWorker(abstract_worker.Worker):
     """Executes one forward/backward pass."""
     trainer = self._ensure_ready()
     req_metadata = dict(request.metadata) if request.metadata else {}
+    self._otel.record_starvation(req_metadata)
     try:
+      # TODO(b/579110728): `fwd_bwd` records host dispatch duration under JAX
+      # async dispatch; queued device time surfaces in the next synchronizing
+      # RPC (`prepare_weight_sync` or `per_token_logps`).
+      t0 = time.perf_counter()
       trainer.fwd_bwd(request.payload)
+      elapsed_s = time.perf_counter() - t0
       self._last_error = None
       resp = self._response(queued=True, **req_metadata)
       resp.request_id = request.request_id
-      return resp
     except Exception as exc:
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+    finally:
+      self._otel.mark_free(arm=True)
+    self._otel.record_step_duration("fwd_bwd", elapsed_s)
+    self._otel.record_payload_tokens(request.payload)
+    return resp
 
   @abstract_worker.offload_to_thread
   def update(self) -> tuple[int, Any]:
     """Applies the accumulated (mean) gradients and returns `(train_step, metrics)`."""
     trainer = self._ensure_ready()
     try:
+      t0 = time.perf_counter()
       train_step = trainer.update()
+      elapsed_s = time.perf_counter() - t0
       metrics = trainer.get_metrics()
       self._last_error = None
-      return train_step, metrics
     except Exception as exc:
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+    finally:
+      self._otel.mark_free()
+    self._otel.record_step_duration("optimizer_step", elapsed_s)
+    return train_step, metrics
 
   @abstract_worker.offload_to_thread
   def eval_step(self, request: datatypes.TrainRequest) -> datatypes.Response:
@@ -327,15 +512,20 @@ class TrainerWorker(abstract_worker.Worker):
     trainer = self._ensure_ready()
     req_metadata = dict(request.metadata) if request.metadata else {}
     try:
+      t0 = time.perf_counter()
       trainer.eval_step(request.payload)
+      elapsed_s = time.perf_counter() - t0
       self._last_error = None
       resp = self._response(evaluated=True, **req_metadata)
       resp.request_id = request.request_id
-      return resp
     except Exception as exc:
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+    finally:
+      self._otel.mark_free()
+    self._otel.record_step_duration("eval_step", elapsed_s)
+    return resp
 
   @abstract_worker.offload_to_thread
   def run_eval(self, eval_ds: Any) -> datatypes.Response:
@@ -359,7 +549,9 @@ class TrainerWorker(abstract_worker.Worker):
       eval_batches = 0
       with context:
         for payload in eval_ds:
+          t0 = time.perf_counter()
           trainer.eval_step(payload)
+          self._otel.record_step_duration("eval_step", time.perf_counter() - t0)
           eval_batches += 1
       self._last_error = None
       return self._response(evaluated=True, eval_batches=eval_batches)
@@ -367,6 +559,8 @@ class TrainerWorker(abstract_worker.Worker):
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+    finally:
+      self._otel.mark_free()
 
   @abstract_worker.offload_to_thread
   def per_token_logps(
@@ -423,6 +617,7 @@ class TrainerWorker(abstract_worker.Worker):
             if routed_enc in ("uint8", "uint10")
             else np.asarray(routed_raw, dtype=np.int16)
         )
+      t0 = time.perf_counter()
       micro_batch_size = self._logps_micro_batch_size or batch_size
       outs = []
       for start in range(0, batch_size, micro_batch_size):
@@ -442,8 +637,9 @@ class TrainerWorker(abstract_worker.Worker):
             )
         )
       result = np.asarray(jnp.concatenate(outs, axis=0), dtype=np.float32)
+      elapsed_s = time.perf_counter() - t0
       self._last_error = None
-      return datatypes.LogprobsResponse(
+      resp = datatypes.LogprobsResponse(
           request_id=items.request_id,
           per_token_logps=result,
           model_version=self._policy_version(),
@@ -452,6 +648,10 @@ class TrainerWorker(abstract_worker.Worker):
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+    finally:
+      self._otel.mark_free()
+    self._otel.record_step_duration("per_token_logps", elapsed_s)
+    return resp
 
   @abstract_worker.offload_to_thread
   def save_checkpoint(
@@ -464,18 +664,27 @@ class TrainerWorker(abstract_worker.Worker):
     """Force the trainer to serialize its state (model + optimizer)."""
     trainer = self._ensure_ready()
     try:
+      t0 = time.perf_counter()
       trainer.save_checkpoint(metadata, step=step, force=force)
+      elapsed_s = time.perf_counter() - t0
       self._last_error = None
-      return self._response(checkpoint_saved=True)
+      resp = self._response(checkpoint_saved=True)
     except Exception as exc:
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+    finally:
+      self._otel.mark_free()
+    self._otel.record_step_duration("checkpoint_save", elapsed_s)
+    return resp
 
   @abstract_worker.offload_to_thread
   def restore_checkpoint(self, step: int | None = None) -> Any:
     """Restore state from a checkpoint and return the metadata pytree."""
-    return self._ensure_ready().restore_checkpoint(step=step)
+    try:
+      return self._ensure_ready().restore_checkpoint(step=step)
+    finally:
+      self._otel.mark_free()
 
   @abstract_worker.offload_to_thread
   def prepare_weight_sync(self, sync_request: Any = None) -> Any:
@@ -483,26 +692,43 @@ class TrainerWorker(abstract_worker.Worker):
     trainer = self._ensure_ready()
     self.state = WorkerState.SYNCING
     try:
+      t0 = time.perf_counter()
       metadata = trainer.prepare_weight_sync(sync_request=sync_request)
+      elapsed_s = time.perf_counter() - t0
       self._last_error = None
-      if metadata is not None:
-        return metadata
-      return self._response(weight_sync_ready=True)
+      resp = (
+          metadata
+          if metadata is not None
+          else self._response(weight_sync_ready=True)
+      )
     except Exception as exc:
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+    finally:
+      self._otel.mark_free()
+    self._otel.record_weight_sync_duration("send", elapsed_s)
+    return resp
 
   @abstract_worker.offload_to_thread
   def release_weight_sync(self, sync_request: Any = None) -> Any:
     """Releases this round's staging and restores READY."""
     # Not `_ensure_ready()`: `prepare_weight_sync` left the state at SYNCING,
     # and `_ensure_ready()` raises unless the state is READY.
-    result = (
-        self._trainer.release_weight_sync(sync_request=sync_request)
-        if self._trainer is not None
-        else None
-    )
+    was_initialized = self._trainer is not None
+    t0 = time.perf_counter()
+    try:
+      result = (
+          self._trainer.release_weight_sync(sync_request=sync_request)
+          if self._trainer is not None
+          else None
+      )
+    finally:
+      self._otel.mark_free()
+    if was_initialized:
+      self._otel.record_weight_sync_duration(
+          "release", time.perf_counter() - t0
+      )
     if self.state == WorkerState.SYNCING:
       self.state = WorkerState.READY
     return result

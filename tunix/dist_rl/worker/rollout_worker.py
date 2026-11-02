@@ -14,17 +14,23 @@
 
 """Top-level RolloutWorker abstractions (Service vs Client Driver)."""
 
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import contextlib
 import dataclasses
 import inspect
 import threading
+import time
 import types
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Union
+from typing import Any, List, Optional, TYPE_CHECKING, Union
+import weakref
 
 from absl import logging
 import numpy as np
 from tunix.dist_rl.common import datatypes
 from tunix.dist_rl.common import gcs_cache
+from tunix.dist_rl.common import lineage
 from tunix.dist_rl.common import registry
 from tunix.dist_rl.common import timeouts
 from tunix.dist_rl.rollout import manager as manager_lib
@@ -32,7 +38,16 @@ from tunix.dist_rl.rollout import sampler as sampler_lib
 from tunix.dist_rl.trajectory import store as trajectory_store_lib
 from tunix.dist_rl.trajectory import trajectory as trajectory_lib
 from tunix.dist_rl.worker import abstract_worker
+from tunix.rl.agentic.agents import agent_types
 from tunix.rl.rollout import base_rollout
+
+if TYPE_CHECKING:
+  from opentelemetry import metrics as otel_metrics_types  # pylint: disable=g-bad-import-order,g-import-not-at-top
+
+try:
+  from opentelemetry import metrics as otel_metrics  # pylint: disable=g-import-not-at-top
+except ImportError:
+  otel_metrics = None
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -68,6 +83,313 @@ TrajectoryOrError = Union[
 WorkerState = datatypes.WorkerState
 
 
+class _RolloutWorkerOtelMetrics:
+  """Encapsulates OpenTelemetry instruments and recording for RolloutWorker."""
+
+  _inflight_lock = threading.Lock()
+  _inflight_by_provider: weakref.WeakKeyDictionary[
+      Any, weakref.WeakSet[_RolloutWorkerOtelMetrics]
+  ] = weakref.WeakKeyDictionary()
+
+  def __init__(
+      self,
+      worker_id: str,
+      inflight_fn: Callable[[], int],
+      meter_provider: otel_metrics_types.MeterProvider | None = None,
+  ):
+    self._worker_id = worker_id
+    self._inflight_fn = inflight_fn
+    self._sync_pause_start_s: float | None = None
+    if otel_metrics is None:
+      self._enabled = False
+      return
+    self._enabled = True
+
+    provider = meter_provider or otel_metrics.get_meter_provider()
+    meter = provider.get_meter("tunix.worker")
+    self._traj_completed = meter.create_counter(
+        "tunix.worker.trajectories.completed",
+        unit="{trajectory}",
+        description="Count of completed rollout trajectories.",
+    )
+    self._turns_total = meter.create_counter(
+        "tunix.worker.turns.total",
+        unit="{turn}",
+        description="Total assistant turns generated across trajectories.",
+    )
+    self._prompt_tokens = meter.create_histogram(
+        "tunix.worker.prompt_tokens",
+        unit="{token}",
+        description="Prompt token count per rollout trajectory.",
+    )
+    self._completion_tokens = meter.create_histogram(
+        "tunix.worker.completion_tokens",
+        unit="{token}",
+        description="Completion token count per rollout trajectory.",
+    )
+    self._execution_sec = meter.create_histogram(
+        "tunix.worker.execution_sec",
+        unit="s",
+        description="End-to-end episode execution time on the rollout worker.",
+    )
+    self._sampler_time_s = meter.create_histogram(
+        "tunix.worker.sampler_time_s",
+        unit="s",
+        description=(
+            "Cumulative model sampler inference latency per trajectory."
+        ),
+    )
+    self._env_time_sec = meter.create_histogram(
+        "tunix.worker.env_time_sec",
+        unit="s",
+        description="Environment interaction latency by operation.",
+    )
+    self._reward_time_sec = meter.create_histogram(
+        "tunix.worker.reward_time_sec",
+        unit="s",
+        description="Final reward computation latency per trajectory.",
+    )
+    self._weight_sync_duration = meter.create_histogram(
+        "tunix.worker.weight_sync.duration",
+        unit="s",
+        description=(
+            "Rollout worker weight sync phase and total paused duration."
+        ),
+    )
+    self.register_inflight_gauge(provider, meter, self)
+
+  @classmethod
+  def register_inflight_gauge(
+      cls,
+      provider: otel_metrics_types.MeterProvider,
+      meter: otel_metrics_types.Meter,
+      instance: _RolloutWorkerOtelMetrics,
+  ) -> None:
+    """Registers `instance` for `requests_inflight` observation on `provider`."""
+    with cls._inflight_lock:
+      instances = cls._inflight_by_provider.get(provider)
+      if instances is not None:
+        instances.add(instance)
+        return
+      instances = weakref.WeakSet([instance])
+      cls._inflight_by_provider[provider] = instances
+
+    def _observe_inflight(
+        options: otel_metrics_types.CallbackOptions,
+    ) -> Iterable[otel_metrics_types.Observation]:
+      del options
+      if otel_metrics is None:
+        return
+      with cls._inflight_lock:
+        live = list(instances)
+      for inst in live:
+        yield otel_metrics.Observation(
+            inst._inflight_fn(),  # pylint: disable=protected-access
+            attributes={"worker_id": inst._worker_id},  # pylint: disable=protected-access
+        )
+
+    meter.create_observable_gauge(
+        "tunix.worker.requests_inflight",
+        callbacks=[_observe_inflight],
+        unit="{request}",
+        description=(
+            "Number of active rollout episodes in flight on this worker."
+        ),
+    )
+
+  @staticmethod
+  def resolve_task_name(metadata: Mapping[str, Any] | None) -> str:
+    """Resolves semantic task_name from LineageContext."""
+    lineage_ctx = metadata.get("lineage") if metadata is not None else None
+    if lineage_ctx is None:
+      return ""
+    if not isinstance(lineage_ctx, lineage.LineageContext):
+      raise TypeError(
+          "Expected LineageContext for metadata['lineage'], got"
+          f" {type(lineage_ctx)!r}."
+      )
+    return lineage_ctx.task_name
+
+  def record_trajectory_error(self, metadata: Mapping[str, Any] | None) -> None:
+    """Records trajectory completion counter for a failed episode."""
+    if not self._enabled:
+      return
+    task_name = self.resolve_task_name(metadata)
+    self._traj_completed.add(
+        1,
+        attributes={
+            "worker_id": self._worker_id,
+            "task_name": task_name,
+            "status": "ERROR",
+            "clipped": "false",
+            "has_error": "true",
+        },
+    )
+
+  def record_trajectory_item(self, item: datatypes.TrajectoryItem) -> None:
+    """Records OpenTelemetry instruments from a completed TrajectoryItem."""
+    if not self._enabled:
+      return
+    if not isinstance(item.traj, Mapping):
+      raise TypeError(
+          f"Expected Mapping for TrajectoryItem.traj, got {type(item.traj)!r}."
+      )
+    traj = item.traj
+    metadata = item.metadata
+    task_name = self.resolve_task_name(metadata)
+    raw_status = traj["status"]
+    status = (
+        raw_status.name
+        if isinstance(raw_status, datatypes.TrajectoryStatus)
+        else datatypes.TrajectoryStatus[str(raw_status)].name
+    )
+    clipped_str = "true" if bool(metadata.get("clipped")) else "false"
+    error_statuses = {s.name for s in agent_types.INVALID_TRAJECTORY_STATUSES}
+    has_error_str = "true" if status in error_statuses else "false"
+
+    self._traj_completed.add(
+        1,
+        attributes={
+            "worker_id": self._worker_id,
+            "task_name": task_name,
+            "status": status,
+            "clipped": clipped_str,
+            "has_error": has_error_str,
+        },
+    )
+    self.record_turns(traj, task_name=task_name)
+    self.record_tokens(
+        traj,
+        task_name=task_name,
+        status=status,
+        clipped_str=clipped_str,
+    )
+    self.record_latencies(traj, task_name=task_name, status=status)
+
+  def record_turns(self, traj: Mapping[str, Any], *, task_name: str) -> None:
+    """Records assistant turn count counter from a trajectory."""
+    if (turn_lens := traj.get("assistant_turn_lengths")) is not None:
+      self._turns_total.add(
+          len(turn_lens),
+          attributes={"worker_id": self._worker_id, "task_name": task_name},
+      )
+
+  def record_tokens(
+      self,
+      traj: Mapping[str, Any],
+      *,
+      task_name: str,
+      status: str,
+      clipped_str: str,
+  ) -> None:
+    """Records prompt and completion token histograms from a trajectory."""
+    prompt_len: int | None = None
+    if (raw_prompt_len := traj.get("prompt_length")) is not None:
+      prompt_len = int(raw_prompt_len)
+    elif (raw_prompt_tokens := traj.get("prompt_tokens")) is not None:
+      prompt_len = len(raw_prompt_tokens)
+    if prompt_len is not None:
+      self._prompt_tokens.record(
+          prompt_len,
+          attributes={
+              "worker_id": self._worker_id,
+              "task_name": task_name,
+              "status": status,
+          },
+      )
+
+    if (turn_lens := traj.get("assistant_turn_lengths")) is not None:
+      self._completion_tokens.record(
+          int(sum(turn_lens)),
+          attributes={
+              "worker_id": self._worker_id,
+              "task_name": task_name,
+              "status": status,
+              "clipped": clipped_str,
+          },
+      )
+
+  def record_latencies(
+      self,
+      traj: Mapping[str, Any],
+      *,
+      task_name: str,
+      status: str,
+  ) -> None:
+    """Records episode, sampler, environment, and reward latency histograms."""
+    base_attrs = {"worker_id": self._worker_id, "task_name": task_name}
+    if (exec_s := traj.get("execution_time_s")) is not None:
+      self._execution_sec.record(
+          float(exec_s), attributes={**base_attrs, "status": status}
+      )
+    if (sampler_s := traj.get("sampler_time_s")) is not None:
+      self._sampler_time_s.record(float(sampler_s), attributes=base_attrs)
+    env_time = traj.get("env_time")
+    if isinstance(env_time, Mapping):
+      for op, key in (("reset", "reset_latency"), ("close", "close_latency")):
+        if (val := env_time.get(key)) is not None:
+          self._env_time_sec.record(
+              float(val), attributes={**base_attrs, "op": op}
+          )
+      for step_val in env_time.get("step_latency") or ():
+        self._env_time_sec.record(
+            float(step_val), attributes={**base_attrs, "op": "step"}
+        )
+    reward_time = traj.get("reward_time")
+    if (
+        isinstance(reward_time, Mapping)
+        and (reward_s := reward_time.get("reward_latency")) is not None
+    ):
+      self._reward_time_sec.record(float(reward_s), attributes=base_attrs)
+
+  def record_pre_weight_sync_start(self) -> float:
+    """Marks the start of a weight-sync pause window and returns the timestamp."""
+    t0 = time.perf_counter()
+    if self._sync_pause_start_s is None:
+      self._sync_pause_start_s = t0
+    return t0
+
+  def record_weight_sync_phase(self, phase: str, start_s: float) -> None:
+    """Records duration of a weight-sync phase (`pre` or `h2d`)."""
+    if not self._enabled:
+      return
+    self._weight_sync_duration.record(
+        float(time.perf_counter() - start_s),
+        attributes={"worker_id": self._worker_id, "phase": phase},
+    )
+
+  def record_post_weight_sync(self, start_s: float) -> None:
+    """Records `post` and `total_paused` weight-sync durations."""
+    end_s = time.perf_counter()
+    if self._enabled:
+      self._weight_sync_duration.record(
+          float(end_s - start_s),
+          attributes={"worker_id": self._worker_id, "phase": "post"},
+      )
+      if self._sync_pause_start_s is not None:
+        self._weight_sync_duration.record(
+            float(end_s - self._sync_pause_start_s),
+            attributes={
+                "worker_id": self._worker_id,
+                "phase": "total_paused",
+            },
+        )
+    self._sync_pause_start_s = None
+
+  def record_abort_weight_sync(self) -> None:
+    """Records `aborted_paused` weight-sync duration if a pause window was open."""
+    end_s = time.perf_counter()
+    if self._enabled and self._sync_pause_start_s is not None:
+      self._weight_sync_duration.record(
+          float(end_s - self._sync_pause_start_s),
+          attributes={
+              "worker_id": self._worker_id,
+              "phase": "aborted_paused",
+          },
+      )
+    self._sync_pause_start_s = None
+
+
 class RolloutWorker(abstract_worker.Worker):
   """Worker wrapper for rollout collection.
 
@@ -88,6 +410,7 @@ class RolloutWorker(abstract_worker.Worker):
       agent_config: Mapping[str, Any] = types.MappingProxyType({}),
       max_concurrency: int = 64,
       jax_cache_config: Optional[gcs_cache.JaxCacheConfig] = None,
+      otel_meter_provider: otel_metrics_types.MeterProvider | None = None,
   ):
     """Initializes the RolloutWorker.
 
@@ -105,6 +428,8 @@ class RolloutWorker(abstract_worker.Worker):
         `metadata["agent_config"]` replaces these entirely when present.
       max_concurrency: Maximum number of concurrent episodes.
       jax_cache_config: Optional JAX compilation cache configuration.
+      otel_meter_provider: Optional OpenTelemetry MeterProvider override for
+        testing; defaults to the global MeterProvider when None.
     """
     super().__init__()
     self.worker_id = worker_id
@@ -156,6 +481,11 @@ class RolloutWorker(abstract_worker.Worker):
         chat_parser=chat_parser,
         drain_timeout_s=drain_timeout_s,
         trajectory_store=self._trajectory_store,
+    )
+    self._otel = _RolloutWorkerOtelMetrics(
+        worker_id=worker_id,
+        inflight_fn=lambda: len(self.manager._active_tasks),  # pylint: disable=protected-access
+        meter_provider=otel_meter_provider,
     )
 
   @property
@@ -333,10 +663,10 @@ class RolloutWorker(abstract_worker.Worker):
       execution_time_s: float | None = None,
   ) -> None:
     """Appends worker generation telemetry to the lineage context if present."""
-    if metadata is None:
+    if metadata is None or "lineage" not in metadata:
       return
-    lineage_ctx = metadata.get("lineage")
-    if lineage_ctx is not None and hasattr(lineage_ctx, "add_event"):
+    lineage_ctx = metadata["lineage"]
+    if isinstance(lineage_ctx, lineage.LineageContext):
       attributes: dict[str, Any] = {"worker_id": self.worker_id}
       if execution_time_s is not None:
         attributes["execution_time_s"] = float(execution_time_s)
@@ -348,7 +678,7 @@ class RolloutWorker(abstract_worker.Worker):
 
   def _to_rollout_response(
       self,
-      item: Any,
+      item: manager_lib.TrajectoryOrError | datatypes.RolloutResponse,
       request_id: str = "",
       prompt_tokens: np.ndarray | None = None,
   ) -> datatypes.RolloutResponse:
@@ -357,6 +687,7 @@ class RolloutWorker(abstract_worker.Worker):
       metadata = dict(item.metadata or {})
       metadata["prompt_id"] = item.prompt_id
       self._stamp_worker_lineage(metadata)
+      self._otel.record_trajectory_error(metadata)
       return datatypes.RolloutResponse(
           request_id=request_id or item.trajectory_id or item.prompt_id,
           status="ERROR",
@@ -370,15 +701,18 @@ class RolloutWorker(abstract_worker.Worker):
     if isinstance(item, datatypes.RolloutResponse):
       return item
     if isinstance(item, datatypes.TrajectoryItem):
-      req_id = request_id or getattr(item, "traj_id", "")
-      if prompt_tokens is not None and getattr(item, "prompt_tokens", None) is None:
+      req_id = request_id or item.traj_id
+      traj_map = item.traj if isinstance(item.traj, Mapping) else {}
+      if (
+          prompt_tokens is not None
+          and traj_map.get("prompt_tokens") is None
+          and item.metadata.get("prompt_tokens") is None
+      ):
         item.metadata["prompt_tokens"] = prompt_tokens
-      exec_time_s = (
-          item.traj.get("execution_time_s")
-          if isinstance(item.traj, dict)
-          else None
+      self._stamp_worker_lineage(
+          item.metadata, execution_time_s=traj_map.get("execution_time_s")
       )
-      self._stamp_worker_lineage(item.metadata, execution_time_s=exec_time_s)
+      self._otel.record_trajectory_item(item)
       return datatypes.RolloutResponse(
           request_id=req_id,
           status="COMPLETED",
@@ -396,34 +730,53 @@ class RolloutWorker(abstract_worker.Worker):
   ) -> datatypes.RolloutResponse | List[datatypes.RolloutResponse]:
     """Coroutine method for single or batched generate requests."""
     self._ensure_initialized()
-    if isinstance(requests, datatypes.RolloutRequest):
-      self._stamp_worker_lineage(requests.metadata, component="worker.received")
-    elif isinstance(requests, Sequence) and not isinstance(
-        requests, (str, bytes)
-    ):
-      if not all(isinstance(req, datatypes.RolloutRequest) for req in requests):
-        raise TypeError(
-            "generate requires `requests` to be a RolloutRequest or"
-            " Sequence[RolloutRequest]."
+    req_list = (
+        [requests]
+        if isinstance(requests, datatypes.RolloutRequest)
+        else requests
+    )
+    if (
+        isinstance(req_list, (str, bytes))
+        or not isinstance(req_list, Sequence)
+        or not all(
+            isinstance(req, datatypes.RolloutRequest) for req in req_list
         )
-      for req in requests:
-        self._stamp_worker_lineage(req.metadata, component="worker.received")
-    else:
+    ):
       raise TypeError(
           "generate requires `requests` to be a RolloutRequest or"
           " Sequence[RolloutRequest]."
       )
+    for req in req_list:
+      self._stamp_worker_lineage(req.metadata, component="worker.received")
 
-    cb = None
-    if on_complete is not None:
-      cb = lambda item: on_complete(self._to_rollout_response(item))
+    converted: dict[
+        int,
+        tuple[
+            manager_lib.TrajectoryOrError | datatypes.RolloutResponse,
+            datatypes.RolloutResponse,
+        ],
+    ] = {}
+
+    def _convert_once(
+        item: manager_lib.TrajectoryOrError | datatypes.RolloutResponse,
+    ) -> datatypes.RolloutResponse:
+      item_key = id(item)
+      if item_key not in converted:
+        converted[item_key] = (item, self._to_rollout_response(item))
+      return converted[item_key][1]
+
+    cb = (
+        (lambda item: on_complete(_convert_once(item)))
+        if on_complete is not None
+        else None
+    )
     res = await self.manager.generate(requests, on_complete=cb)
-    if isinstance(res, (list, tuple)):
-      responses = [self._to_rollout_response(r) for r in res]
+    if isinstance(res, Sequence):
+      responses = [_convert_once(r) for r in res]
       for resp in responses:
         self._jax_cache_syncer.sync_after_first_completed(resp.status)
       return responses
-    resp = self._to_rollout_response(res)
+    resp = _convert_once(res)
     self._jax_cache_syncer.sync_after_first_completed(resp.status)
     return resp
 
@@ -431,8 +784,10 @@ class RolloutWorker(abstract_worker.Worker):
     """Quiesces the worker; it stays SYNCING until post or abort."""
     self._ensure_initialized()
     self.state = WorkerState.SYNCING
+    t0 = self._otel.record_pre_weight_sync_start()
     self._record_round(sync_request, "idle")
     result = await self.manager.pre_weight_sync(sync_request, **kwargs)
+    self._otel.record_weight_sync_phase("pre", t0)
     self._record_round(sync_request, "prepared")
     return result
 
@@ -442,7 +797,9 @@ class RolloutWorker(abstract_worker.Worker):
     self.state = WorkerState.SYNCING
     metadata = kwargs.pop("metadata", None)
     request = sync_request if sync_request is not None else metadata
+    t0 = time.perf_counter()
     result = await self.manager.weight_sync(request, **kwargs)
+    self._otel.record_weight_sync_phase("h2d", t0)
     if isinstance(result, int):
       self._policy_version = result
     else:
@@ -456,8 +813,10 @@ class RolloutWorker(abstract_worker.Worker):
 
   async def post_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Publishes the new weights and resumes serving."""
+    t0 = time.perf_counter()
     result = await self.manager.post_weight_sync(sync_request, **kwargs)
     self.state = WorkerState.READY
+    self._otel.record_post_weight_sync(t0)
     self._record_round(sync_request, "committed")
     return result
 
@@ -476,6 +835,8 @@ class RolloutWorker(abstract_worker.Worker):
     res = await self.manager.abort_weight_sync(sync_request, **kwargs)
     self.state = WorkerState.READY
     self._record_round(sync_request, "aborted")
+    if self._sync_round["phase"] == "aborted":
+      self._otel.record_abort_weight_sync()
     return res
 
   async def get_weight_sync_status(self, **kwargs) -> Any:

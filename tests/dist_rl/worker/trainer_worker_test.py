@@ -19,6 +19,7 @@ AbstractTrainer (fwd_bwd, eval_step, update), response metadata stamping, and
 per-token log-prob scorer run through AbstractTrainer.fwd_only.
 """
 
+import collections
 import dataclasses
 import functools
 import threading
@@ -29,6 +30,8 @@ from absl.testing import absltest
 from flax import nnx
 import jax.numpy as jnp
 import numpy as np
+from opentelemetry.sdk import metrics as sdk_metrics
+from opentelemetry.sdk.metrics import export as sdk_metrics_export
 from tunix.dist_rl.common import datatypes
 from tunix.dist_rl.train import abstract_trainer
 from tunix.dist_rl.worker import trainer_worker
@@ -850,6 +853,354 @@ class TrainerWorkerExecutionContextTest(absltest.TestCase):
       self.worker.stop()
     self.assertEqual(close_calls, [1])
     self.assertEqual(observed_aborts, [True, True])
+
+
+def _collect_otel_metrics(reader: sdk_metrics_export.InMemoryMetricReader):
+  """Extracts {metric_name: [(value_or_sum, count_or_none, dict(attributes)), ...]}."""
+  data = reader.get_metrics_data()
+  collected = collections.defaultdict(list)
+  for resource_metric in data.resource_metrics:
+    for scope_metric in resource_metric.scope_metrics:
+      for metric in scope_metric.metrics:
+        for dp in metric.data.data_points:
+          val = dp.sum if hasattr(dp, "sum") else dp.value
+          cnt = dp.count if hasattr(dp, "count") else None
+          collected[metric.name].append((val, cnt, dict(dp.attributes)))
+  return collected
+
+
+class TrainerWorkerOTelMetricsTest(absltest.TestCase):
+  """Verifies direct OpenTelemetry SDK instruments emitted by TrainerWorker."""
+
+  def setUp(self):
+    super().setUp()
+    self.reader = sdk_metrics_export.InMemoryMetricReader()
+    self.meter_provider = sdk_metrics.MeterProvider(
+        metric_readers=[self.reader]
+    )
+    self.fake_trainer = FakeTrainer()
+    self.worker = trainer_worker.TrainerWorker(
+        trainer_factory=lambda: self.fake_trainer,
+        worker_id="trainer_otel_0",
+        otel_meter_provider=self.meter_provider,
+    )
+    self.worker.initialize()
+
+  def test_emits_step_duration_tokens_processed_and_weight_sync_duration(self):
+    # 1. Padded RLTrainerPayload: prompt (2x3, 4 valid + 2 pad),
+    # completion (2x4, 5 valid + 3 pad) => total=14, valid=9, padded=5.
+    padded_rl_req = datatypes.TrainRequest(
+        request_id="req-padded",
+        payload=datatypes.RLTrainerPayload(
+            prompt_ids=np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32),
+            prompt_mask=np.array(
+                [[0.0, 1.0, 1.0], [1.0, 1.0, 0.0]], dtype=np.float32
+            ),
+            completion_ids=np.array(
+                [[10, 11, 12, 0], [20, 21, 0, 0]], dtype=np.int32
+            ),
+            completion_mask=np.array(
+                [[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]], dtype=np.float32
+            ),
+            advantages=np.array([1.0, -1.0], dtype=np.float32),
+        ),
+    )
+    self.worker.fwd_bwd(request=padded_rl_req)
+
+    # 2. Sequence-packed RLTrainerPayload: prompt (1x0), completion (1x6) with
+    # segment_ids [1, 1, 2, 2, 0, 0] => total=6, valid=4, padded=2.
+    # Also pass `mb_ready_time_s` to verify `data_fetch_delay` starvation.
+    packed_rl_req = datatypes.TrainRequest(
+        request_id="req-packed",
+        payload=datatypes.RLTrainerPayload(
+            prompt_ids=np.zeros((1, 0), dtype=np.int32),
+            prompt_mask=np.zeros((1, 0), dtype=np.float32),
+            completion_ids=np.array([[1, 2, 3, 4, 0, 0]], dtype=np.int32),
+            completion_mask=np.array(
+                [[0.0, 1.0, 0.0, 1.0, 0.0, 0.0]], dtype=np.float32
+            ),
+            advantages=np.zeros((1, 6), dtype=np.float32),
+            segment_ids=np.array([[1, 1, 2, 2, 0, 0]], dtype=np.int32),
+            segment_positions=np.array([[0, 1, 0, 1, 0, 0]], dtype=np.int32),
+        ),
+        metadata={"mb_ready_time_s": 0.0},
+    )
+    self.worker.fwd_bwd(request=packed_rl_req)
+
+    # 3. SFTTrainerPayload: token_ids (1x4) with 3 valid + 1 pad.
+    sft_req = datatypes.TrainRequest(
+        request_id="req-sft",
+        payload=datatypes.SFTTrainerPayload(
+            token_ids=np.array([[1, 2, 3, 0]], dtype=np.int32),
+            token_mask=np.array([[1.0, 1.0, 1.0, 0.0]], dtype=np.float32),
+        ),
+    )
+    self.worker.fwd_bwd(request=sft_req)
+
+    # 4. update, eval_step, per_token_logps, save_checkpoint, and
+    # prepare_weight_sync.
+    self.worker.update()
+    self.worker.eval_step(request=sft_req)
+    self.worker.per_token_logps(
+        items=datatypes.LogprobsRequest(
+            prompt_tokens=np.zeros((1, 0), dtype=np.int32),
+            completion_tokens=np.array([[3, 4]], dtype=np.int32),
+            temperature=1.0,
+            pad_id=0,
+            eos_id=1,
+        )
+    )
+    self.worker.save_checkpoint(metadata={"step": 11}, step=11)
+    self.worker.prepare_weight_sync()
+    self.worker.release_weight_sync()
+
+    metrics = _collect_otel_metrics(self.reader)
+
+    # Verify tokens.processed: valid = 9 + 4 + 3 = 16, padded = 5 + 2 + 1 = 8
+    tokens_by_type = {
+        attrs["token_type"]: (val, attrs)
+        for val, _, attrs in metrics["tunix.trainer.tokens.processed"]
+    }
+    self.assertEqual(
+        tokens_by_type["valid"],
+        (16, {"worker_id": "trainer_otel_0", "token_type": "valid"}),
+    )
+    self.assertEqual(
+        tokens_by_type["padded"],
+        (8, {"worker_id": "trainer_otel_0", "token_type": "padded"}),
+    )
+
+    # Verify step.duration phases
+    step_by_phase = {
+        attrs["phase"]: (val, cnt, attrs)
+        for val, cnt, attrs in metrics["tunix.trainer.step.duration"]
+    }
+    self.assertCountEqual(
+        step_by_phase.keys(),
+        [
+            "fwd_bwd",
+            "optimizer_step",
+            "eval_step",
+            "per_token_logps",
+            "checkpoint_save",
+        ],
+    )
+    self.assertEqual(step_by_phase["fwd_bwd"][1], 3)
+    self.assertEqual(step_by_phase["optimizer_step"][1], 1)
+    self.assertEqual(step_by_phase["eval_step"][1], 1)
+    self.assertEqual(step_by_phase["per_token_logps"][1], 1)
+    self.assertEqual(step_by_phase["checkpoint_save"][1], 1)
+    for phase_val, _, phase_attrs in step_by_phase.values():
+      self.assertGreaterEqual(phase_val, 0.0)
+      self.assertEqual(phase_attrs["worker_id"], "trainer_otel_0")
+
+    # Verify weight_sync.duration (both prepare "send" and "release")
+    ws_by_dir = {
+        attrs["direction"]: (val, cnt, attrs)
+        for val, cnt, attrs in metrics["tunix.trainer.weight_sync.duration"]
+    }
+    self.assertCountEqual(ws_by_dir.keys(), ["send", "release"])
+    self.assertEqual(ws_by_dir["send"][1], 1)
+    self.assertEqual(ws_by_dir["release"][1], 1)
+    for ws_val, _, ws_attrs in ws_by_dir.values():
+      self.assertGreaterEqual(ws_val, 0.0)
+      self.assertEqual(ws_attrs["worker_id"], "trainer_otel_0")
+
+    # Verify starvation.duration (`trainer_idle` on microbatches 2 & 3,
+    # `data_fetch_delay` on microbatch 2 with `mb_ready_time_s`).
+    starv_by_kind = {
+        attrs["kind"]: (val, cnt, attrs)
+        for val, cnt, attrs in metrics["tunix.trainer.starvation.duration"]
+    }
+    self.assertCountEqual(
+        starv_by_kind.keys(), ["trainer_idle", "data_fetch_delay"]
+    )
+    self.assertEqual(starv_by_kind["trainer_idle"][1], 2)
+    self.assertEqual(starv_by_kind["data_fetch_delay"][1], 1)
+    for st_val, _, st_attrs in starv_by_kind.values():
+      self.assertGreaterEqual(st_val, 0.0)
+      self.assertEqual(st_attrs["worker_id"], "trainer_otel_0")
+
+  def test_packed_sft_tokens_and_failed_fwd_bwd_edge_cases(self):
+    # 1. Sequence-packed SFTTrainerPayload counts `segment_ids > 0` (3 valid, 1
+    # pad) even when `token_mask` only marks 1 assistant token.
+    packed_sft_req = datatypes.TrainRequest(
+        request_id="req-packed-sft",
+        payload=datatypes.SFTTrainerPayload(
+            token_ids=np.array([[10, 11, 12, 0]], dtype=np.int32),
+            token_mask=np.array([[0.0, 1.0, 0.0, 0.0]], dtype=np.float32),
+            segment_ids=np.array([[1, 1, 2, 0]], dtype=np.int32),
+        ),
+    )
+    # 2. Full-sequence [B, P+C] `segment_ids` on RLTrainerPayload with non-empty
+    # prompt must not double-count prompt tokens (total=5, valid=4, padded=1).
+    full_seg_rl_req = datatypes.TrainRequest(
+        request_id="req-full-seg-rl",
+        payload=datatypes.RLTrainerPayload(
+            prompt_ids=np.array([[1, 2]], dtype=np.int32),
+            prompt_mask=np.array([[1.0, 1.0]], dtype=np.float32),
+            completion_ids=np.array([[3, 4, 0]], dtype=np.int32),
+            completion_mask=np.array([[1.0, 1.0, 0.0]], dtype=np.float32),
+            advantages=np.zeros((1, 3), dtype=np.float32),
+            segment_ids=np.array([[1, 1, 1, 1, 0]], dtype=np.int32),
+        ),
+    )
+    orig_fwd_bwd = self.fake_trainer.fwd_bwd
+    # Mock wall clock on `self.worker._otel._clock` (isolated from JAX internal
+    # `time.time()` calls during cold compilation):
+    # - Call 1 (`packed_sft_req`): `finally` arms free_time = 10.0
+    # - Call 2 (failing `fwd_bwd`): `record_starvation` reads 12.0 (idle=2.0),
+    #   then raises `RuntimeError`, and `finally` sets free_time = 15.0
+    # - Call 3 (`full_seg_rl_req` after resetting `_state` to `READY`, since
+    #   `WorkerState.ERROR` is terminal): `record_starvation` reads 15.5
+    #   (idle = 15.5 - 15.0 = 0.5, proving the failed call's `finally` updated
+    #   free_time to 15.0), and `finally` sets 16.0.
+    with mock.patch.object(
+        self.worker._otel,
+        "_clock",
+        side_effect=[10.0, 12.0, 15.0, 15.5, 16.0],
+    ):
+      self.worker.fwd_bwd(request=packed_sft_req)
+      self.fake_trainer.fwd_bwd = mock.MagicMock(
+          side_effect=RuntimeError("nan loss")
+      )
+      with self.assertRaisesRegex(RuntimeError, "nan loss"):
+        self.worker.fwd_bwd(request=packed_sft_req)
+      self.fake_trainer.fwd_bwd = orig_fwd_bwd
+      self.worker._state = datatypes.WorkerState.READY
+      self.worker.fwd_bwd(request=full_seg_rl_req)
+
+    # A failing `release_weight_sync` must keep `WorkerState.SYNCING` (fail
+    # closed, matching HEAD) and record no `direction="release"` sample.
+    self.worker.prepare_weight_sync()
+    self.assertEqual(self.worker.state, datatypes.WorkerState.SYNCING)
+    self.fake_trainer.release_weight_sync = mock.MagicMock(
+        side_effect=RuntimeError("release failed")
+    )
+    with self.assertRaisesRegex(RuntimeError, "release failed"):
+      self.worker.release_weight_sync()
+    self.assertEqual(self.worker.state, datatypes.WorkerState.SYNCING)
+
+    metrics = _collect_otel_metrics(self.reader)
+    tokens_by_type = {
+        attrs["token_type"]: val
+        for val, _, attrs in metrics["tunix.trainer.tokens.processed"]
+    }
+    # valid = 3 (SFT) + 4 (RL) = 7; padded = 1 (SFT) + 1 (RL) = 2.
+    # The failed `fwd_bwd` recorded 0 tokens and 0 step durations.
+    self.assertEqual(tokens_by_type, {"valid": 7, "padded": 2})
+    step_by_phase = {
+        attrs["phase"]: cnt
+        for _, cnt, attrs in metrics["tunix.trainer.step.duration"]
+    }
+    self.assertEqual(step_by_phase, {"fwd_bwd": 2})
+    ws_by_dir = {
+        attrs["direction"]: cnt
+        for _, cnt, attrs in metrics["tunix.trainer.weight_sync.duration"]
+    }
+    self.assertEqual(ws_by_dir, {"send": 1})
+    starv_by_kind = {
+        attrs["kind"]: (val, cnt)
+        for val, cnt, attrs in metrics["tunix.trainer.starvation.duration"]
+    }
+    # Total idle = 2.0 (before failed call) + 0.5 (after failed call at 15.0)
+    self.assertAlmostEqual(starv_by_kind["trainer_idle"][0], 2.5, places=5)
+    self.assertEqual(starv_by_kind["trainer_idle"][1], 2)
+
+  def test_starvation_values_and_non_train_rpc_busy_anchor(self):
+    sft_req = datatypes.TrainRequest(
+        request_id="req-sft",
+        payload=datatypes.SFTTrainerPayload(
+            token_ids=np.array([[1, 2]], dtype=np.int32),
+            token_mask=np.array([[1.0, 1.0]], dtype=np.float32),
+        ),
+    )
+    # Startup `compile` and initial weight sync before the first `fwd_bwd` must
+    # NOT arm `last_free_time_s`, so MB1 emits zero cold-start starvation.
+    self.worker.compile({"dummy": 1})
+    self.worker.prepare_weight_sync()
+    self.worker.release_weight_sync()
+    self.assertIsNone(self.worker._otel.last_free_time_s)
+
+    # Wall-clock sequence on `self.worker._otel._clock`:
+    # 1. MB1 `fwd_bwd`: cold start (no starvation), `finally` arms -> 10.0
+    # 2. MB2 (`mb_ready=8.0 < last_free=10.0`): start=10.5 -> idle=0.5,
+    #    fetch_delay = 10.5 - max(10.0, 8.0) = 0.5; `finally` -> 11.0
+    # 3. MB3 (`mb_ready=13.0 > last_free=11.0`): start=13.5 -> idle=2.5,
+    #    fetch_delay = 13.5 - max(11.0, 13.0) = 0.5; `finally` -> 14.0
+    # 4. MB4 (`mb_ready=20.0 > start=16.0`, future clock skew): start=16.0 ->
+    #    idle=2.0, fetch_delay = max(0.0, 16.0 - 20.0) = 0.0; `finally` -> 17.0
+    # 5. `per_token_logps`: `finally` updates armed free_time -> 25.0
+    # 6. MB5 (after `per_token_logps`, `mb_ready="invalid"`): start=25.25 ->
+    #    idle = 25.25 - 25.0 = 0.25 (excludes [17.0, 25.0] scoring window);
+    #    `finally` -> 26.0
+    # 7. `run_eval` over 2 batches: `finally` -> 30.0
+    with mock.patch.object(
+        self.worker._otel,
+        "_clock",
+        side_effect=[
+            10.0,
+            10.5,
+            11.0,
+            13.5,
+            14.0,
+            16.0,
+            17.0,
+            25.0,
+            25.25,
+            26.0,
+            30.0,
+        ],
+    ):
+      self.worker.fwd_bwd(request=sft_req)
+      self.worker.fwd_bwd(
+          request=dataclasses.replace(
+              sft_req, metadata={"mb_ready_time_s": 8.0}
+          )
+      )
+      self.worker.fwd_bwd(
+          request=dataclasses.replace(
+              sft_req, metadata={"mb_ready_time_s": 13.0}
+          )
+      )
+      self.worker.fwd_bwd(
+          request=dataclasses.replace(
+              sft_req, metadata={"mb_ready_time_s": 20.0}
+          )
+      )
+      self.worker.per_token_logps(
+          items=datatypes.LogprobsRequest(
+              prompt_tokens=np.zeros((1, 0), dtype=np.int32),
+              completion_tokens=np.array([[3, 4]], dtype=np.int32),
+              temperature=1.0,
+              pad_id=0,
+              eos_id=1,
+          )
+      )
+      self.worker.fwd_bwd(
+          request=dataclasses.replace(
+              sft_req, metadata={"mb_ready_time_s": "not-a-float"}
+          )
+      )
+      self.worker.run_eval(eval_ds=[sft_req.payload, sft_req.payload])
+
+    metrics = _collect_otel_metrics(self.reader)
+    starv_by_kind = {
+        attrs["kind"]: (val, cnt)
+        for val, cnt, attrs in metrics["tunix.trainer.starvation.duration"]
+    }
+    # trainer_idle sum = 0.5 + 2.5 + 2.0 + 0.25 = 5.25 across 4 microbatches.
+    self.assertAlmostEqual(starv_by_kind["trainer_idle"][0], 5.25, places=5)
+    self.assertEqual(starv_by_kind["trainer_idle"][1], 4)
+    # data_fetch_delay sum = 0.5 + 0.5 + 0.0 = 1.0 across 3 valid samples.
+    self.assertAlmostEqual(starv_by_kind["data_fetch_delay"][0], 1.0, places=5)
+    self.assertEqual(starv_by_kind["data_fetch_delay"][1], 3)
+
+    step_by_phase = {
+        attrs["phase"]: cnt
+        for _, cnt, attrs in metrics["tunix.trainer.step.duration"]
+    }
+    self.assertEqual(step_by_phase["eval_step"], 2)
 
 
 if __name__ == "__main__":
